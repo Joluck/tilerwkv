@@ -76,6 +76,94 @@ capturing. StateTune chunk metadata is prepared once with
 `prepare_tmix_wkv7_statetune_metadata` and supplied through `prepared_metadata`;
 see the [training contract](docs/kernel_api.md#training).
 
+## Local changes in this fork
+
+This tree carries four additions on top of `0.1.0a18`. All of them are additive:
+default calls keep the released behaviour.
+
+### Recurrent-state checkpoints (speculative decoding)
+
+The WKV-7 inference kernels can write the per-token recurrent state while they
+run, so a speculative decoder can rewind to any accepted prefix without
+replaying it:
+
+```python
+out, boundaries = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+    r, w, k, v, a, b,
+    state=state,
+    cu_seqlens=cu,
+    state_indices=indices,
+    save=True,              # new: write per-token state checkpoints
+    checkpoint_interval=1,  # new: token stride, kernel default is 16
+)
+```
+
+- `boundaries` has shape `(n // checkpoint_interval + batch, heads, head_dim,
+  head_dim)` and is indexed as `CU[seq] + seq + offset`; entry `i` is the state
+  **before** token `i`, i.e. the state after `i` consumed tokens.
+- `save=True` returns `(output, boundaries)` instead of `output`.
+- `checkpoint_interval` is now a kernel constexpr. The training path keeps the
+  module default of 16, so its forward and the backward checkpoint replay are
+  unchanged.
+
+### Post-norm shift-state export
+
+`infer_tmix_postnorm_tokenshift_forward_varlen` and `infer_cmix_forward_varlen`
+accept `save_normalized=` with a `(rows, channels)` BF16 buffer:
+
+```python
+residual, xr, xw, xk, xv, xa, xg = infer_tmix_postnorm_tokenshift_forward_varlen(
+    x, res, weight, bias, x_r, x_w, x_k, x_v, x_a, x_g,
+    shift_state_pool=pool,
+    cu_seqlens=cu,
+    state_indices=indices,
+    save_normalized=buffer,   # new: per-token post-norm input
+)
+```
+
+`buffer[row]` is exactly the value the kernel leaves in the shift-state pool for
+a sequence that ends at `row`, which makes the token-shift state rewindable to
+the same granularity as the recurrent state.
+
+### H100 compile target
+
+`_internal/linear.py` and `tmix/wkv_prepare/tilelang.py` select `sm_90a` for
+`arch == 90`. H100 exposes `sm_90`, but the warpgroup kernels require the `a`
+suffix, so the previous target failed to compile on H100.
+
+### `flashrwkv2.mtp.DraftLoop`
+
+`flashrwkv2/mtp` adds a static-buffer light-MTP draft loop. Every intermediate
+lives in a preallocated buffer, the loop never synchronizes to the host, and the
+whole K-step loop can be captured once and replayed as a single graph launch:
+
+```python
+from flashrwkv2.mtp import DraftLoop
+
+loop = DraftLoop.from_state_dict(block_state, lm_head_weight, depth=2)
+loop.capture(embed)
+ids = loop.replay(hidden, token_ids)   # [1, depth], device tensor
+```
+
+Draft ids match the allocating torch reference and the graph replay bitwise. The
+loop is bandwidth bound on the shared LM head, so graph capture only removes the
+launch and allocation overhead (H100 SXM, BF16, batch 1):
+
+| depth | eager | graph | speed-up | head reads |
+|------:|------:|------:|---------:|-----------:|
+| 2 | 1.746 ms | 1.681 ms | 1.04x | 2.49 GB |
+| 3 | 2.610 ms | 2.517 ms | 1.04x | 3.73 GB |
+| 5 | 4.315 ms | 4.189 ms | 1.03x | 6.22 GB |
+
+Reproduce with:
+
+```bash
+./.venv/bin/python benchmarks/mtp/draft/bench.py --depth 2
+```
+
+Cutting the draft below this floor needs fewer weight bytes, for example an FP8
+copy of the block and head weights; the kernels in this tree are BF16 only.
+
 ## Tests
 
 ```bash

@@ -152,7 +152,7 @@ def _compile_spec(
         ),
         {
             "out_idx": [3],
-            "target": {"kind": "cuda", "arch": f"sm_{arch}"},
+            "target": {"kind": "cuda", "arch": f"sm_{arch}a" if arch == 90 else f"sm_{arch}"},
             "pass_configs": pass_configs,
         },
     )
@@ -471,7 +471,7 @@ def _adapter_kernel(outputs, dtype, scale, arch):
     return tilelang.compile(
         epilogue,
         out_idx=[2],
-        target={"kind": "cuda", "arch": f"sm_{arch}"},
+        target={"kind": "cuda", "arch": f"sm_{arch}a" if arch == 90 else f"sm_{arch}"},
         pass_configs=_PASS_CONFIG,
     )
 
@@ -550,7 +550,7 @@ def _nora_kernel(rank, channels, dtype, strides, backward, arch):
 
     return tilelang.compile(
         normalize,
-        target={"kind": "cuda", "arch": f"sm_{arch}"},
+        target={"kind": "cuda", "arch": f"sm_{arch}a" if arch == 90 else f"sm_{arch}"},
         pass_configs=_PASS_CONFIG,
     )
 

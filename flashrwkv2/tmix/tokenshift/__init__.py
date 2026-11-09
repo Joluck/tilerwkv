@@ -28,8 +28,14 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
     max_seqlen: int | None = None,
     eps: float = 1.0e-5,
     validated_metadata: object | None = None,
+    save_normalized: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Packed BF16 res, ln and TokenShift with active-slot state updates."""
+    """Packed BF16 res, ln and TokenShift with active-slot state updates.
+
+    ``save_normalized`` optionally receives the per-token post-norm input, which
+    is exactly the value the kernel leaves in the shift-state pool for the last
+    token of each sequence.  It enables exact recurrent-state rewind.
+    """
     from ..._internal.state import gather_state, scatter_state
     from ...post_norm.tilelang import norm
     from .tilelang import fused_post_norm_tokenshift, tokenshift
@@ -61,6 +67,13 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
         )
         return (total, *mixed)
     normalized, total = norm(x, weight, bias, eps, res, return_res=True)
+    if save_normalized is not None:
+        if save_normalized.shape != normalized.shape:
+            raise ValueError(
+                "save_normalized must match the packed token shape "
+                f"{tuple(normalized.shape)}, got {tuple(save_normalized.shape)}"
+            )
+        save_normalized.copy_(normalized)
     initial = gather_state(shift_state_pool, indices, status)
     mixed, final = tokenshift(
         normalized, (x_r, x_w, x_k, x_v, x_a, x_g), cu, initial, _status=status,

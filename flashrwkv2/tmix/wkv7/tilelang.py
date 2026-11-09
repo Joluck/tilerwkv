@@ -82,12 +82,13 @@ def _forward_kernel(
     bias_dtype: str = "float32",
     prefetch_tokens: int = 1,
     state_dtype: str = "float32",
+    checkpoint_interval: int = _CHECKPOINT,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
     columns = min(block_values, dim)
     key_groups = dim // 64
-    checkpoints = n // _CHECKPOINT + batch
+    checkpoints = n // checkpoint_interval + batch
     threads = columns * key_groups
     within_loop = T.unroll if prefetch_tokens > 1 and dim <= 128 else T.serial
 
@@ -190,10 +191,10 @@ def _forward_kernel(
                 for within in within_loop(prefetch_tokens):
                     token = start + chunk * prefetch_tokens + within
                     if prefetch_tokens == 1 or token < end:
-                        if save and (token - start) % _CHECKPOINT == 0:
+                        if save and (token - start) % checkpoint_interval == 0:
                             checkpoint = (
-                                start // _CHECKPOINT + seq
-                                + (token - start) // _CHECKPOINT
+                                start // checkpoint_interval + seq
+                                + (token - start) // checkpoint_interval
                             )
                             for key, value in T.Parallel(dim, columns):
                                 Boundaries[
@@ -486,6 +487,7 @@ def _forward(
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
         prefetch_tokens,
         str(initial_state.dtype).removeprefix("torch."),
+        _CHECKPOINT,
     )(
         r,
         decay_logits,
@@ -672,6 +674,9 @@ def _infer_recurrent(
     decay_bias=None,
     block_values=None,
     prefetch_tokens=None,
+    save=False,
+    boundaries=None,
+    checkpoint_interval=_CHECKPOINT,
 ):
     """Launch the common forward directly against an indexed inference pool."""
     if (
@@ -722,18 +727,34 @@ def _infer_recurrent(
     bias = _bias_tensor(r, decay_bias)
     output = torch.empty_like(v)
     empty = torch.empty((0, heads, dim, dim), dtype=state_pool.dtype, device=r.device)
+    if save:
+        expected = r.shape[0] // checkpoint_interval + batch
+        if boundaries is None:
+            boundaries = torch.empty(
+                (expected, heads, dim, dim),
+                dtype=state_pool.dtype,
+                device=r.device,
+            )
+        elif boundaries.shape != (expected, heads, dim, dim):
+            raise ValueError(
+                "boundaries must have shape "
+                f"{(expected, heads, dim, dim)}, got {tuple(boundaries.shape)}"
+            )
+    else:
+        boundaries = empty
     _prepared_forward_kernel(
         r.device, heads,
         dim,
         float(scale),
         bias.numel() != 0,
-        False,
+        save,
         block_values,
         True,
         True,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
         prefetch_tokens,
         str(state_pool.dtype).removeprefix("torch."),
+        checkpoint_interval,
     )(
         r,
         decay_logits,
@@ -748,8 +769,11 @@ def _infer_recurrent(
         state_indices,
         output,
         empty,
-        empty,
+        boundaries,
     )
+    if save:
+        output, boundaries = output, boundaries
+        return output, boundaries
     return output
 
 

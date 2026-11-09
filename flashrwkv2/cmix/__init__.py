@@ -63,6 +63,7 @@ def _project(
     value_lora_scale=1.0,
     key_use_nora=False,
     value_use_nora=False,
+    save_normalized=None,
 ):
     from .._internal.elementwise import activation
     from .._internal.linear import adapter_linear
@@ -163,6 +164,7 @@ def infer_cmix_forward_varlen(
     value_lora_scale=1.0,
     key_use_nora=False,
     value_use_nora=False,
+    save_normalized=None,
 ):
     """Apply res/ln, TokenShift, ReLU² and projection to packed rows.
 
@@ -242,6 +244,13 @@ def infer_cmix_forward_varlen(
             value_use_nora,
         )
     normalized, residual = norm(x, weight, bias, eps, res, return_res=True)
+    if save_normalized is not None:
+        if save_normalized.shape != normalized.shape:
+            raise ValueError(
+                "save_normalized must match the packed token shape "
+                f"{tuple(normalized.shape)}, got {tuple(save_normalized.shape)}"
+            )
+        save_normalized.copy_(normalized)
     initial = gather_state(shift_state_pool, state_indices, status)
     output, final = _cmix(
         normalized,
@@ -278,6 +287,7 @@ def pretrain_cmix_bf16(
     value_lora_scale=1.0,
     key_use_nora=False,
     value_use_nora=False,
+    save_normalized=None,
 ):
     return statetune_cmix_bf16(
         x,
@@ -311,6 +321,7 @@ def statetune_cmix_bf16(
     value_lora_scale=1.0,
     key_use_nora=False,
     value_use_nora=False,
+    save_normalized=None,
 ):
     """Use differentiable initial/final TokenShift state for chunked training."""
     if x.ndim != 3 or x.numel() == 0:
